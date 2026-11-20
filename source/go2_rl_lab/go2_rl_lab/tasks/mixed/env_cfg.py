@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import math
 from dataclasses import dataclass, field
 
@@ -115,7 +116,8 @@ def make_scene(num_envs: int, terrain_type: str = "generator", env_spacing: floa
     if terrain_type == "generator":
         terrain = TerrainEntityCfg(
             terrain_type="generator",
-            terrain_generator=MIXED_TERRAIN_CFG,
+            # Each task cfg owns its generator: play mode mutates rows/columns.
+            terrain_generator=copy.deepcopy(MIXED_TERRAIN_CFG),
             max_init_terrain_level=5,
             env_spacing=env_spacing,
         )

@@ -133,8 +133,10 @@ Any mjlab/tyro config field can be overridden on top, for example:
 Notes:
 
 - Mixed tasks generate a 10 x 20 terrain grid on first start: **about 7 minutes** before iteration 0.
-- An 8 GB GPU comfortably fits 2048 environments (measured: ~3 GB for flat, ~6.2 GB total for
-  MoE-CTS at 2048). Do not run two trainings on one GPU.
+- GPU/host memory: 2048 flat environments use ~3 GB of GPU memory; 1024 mixed-terrain
+  environments use ~1.7 GB on top of the desktop. Mixed tasks also need several GB of **host**
+  RAM, so close heavy desktop apps before a 2048-environment run. Do not run two trainings on
+  one GPU.
 - Checkpoints are written every `save_interval` (500) iterations as `model_<iter>.pt`, plus a final
   checkpoint; directory `logs/rsl_rl/<timestamp>_<run_name>/`.
 - Resume continues the curriculum step counter, so terrain/command curricula do not restart.

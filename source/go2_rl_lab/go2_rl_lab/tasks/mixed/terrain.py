@@ -69,8 +69,10 @@ def _emit_height_field(
     )
 
     if spawn_height is None:
+        # MuJoCo stores the height field as (noise - elevation_min) * vertical_scale
+        # on top of the geom offset, so the spawn height must use the same mapping.
         center = (noise.shape[0] // 2, noise.shape[1] // 2)
-        spawn_height = float(noise[center]) * vertical_scale
+        spawn_height = float(noise[center] - elevation_min) * vertical_scale
     origin = np.array([cfg.size[0] / 2, cfg.size[1] / 2, spawn_height + hfield_z_offset])
     return TerrainOutput(origin=origin, geometries=[TerrainGeometry(geom=hfield_geom, hfield=field)])
 
@@ -242,17 +244,16 @@ class PyramidStairsTerrainCfg(SubTerrainCfg):
 class WheelsTerrainCfg(SubTerrainCfg):
     """Field of flat tyres around a tyre-free spawn disc.
 
-    MuJoCo only collides convex geoms, so a merged tyre mesh would be replaced
-    by its convex hull and turn the whole tile into a slab. Each tyre is
-    therefore built from ``ring_segments`` convex box wedges that keep the inner
-    hole and never trigger the EPA polytope warning.
+    Each tyre is one solid cylinder geom: MuJoCo only collides convex geoms, and
+    a ring of convex wedges would multiply the geom count by ``ring_segments``.
+    Per-world geom state in MuJoCo Warp scales with ``ngeom * num_envs``, so the
+    convex-hull mesh (or a wedge ring) makes 2048-environment training exhaust
+    GPU memory. The inner hole is therefore approximated away; the tyre radius,
+    height, pitch and spawn disc match the source task.
     """
 
     outer_radius: float = 0.30
     """Tyre outer radius in meters (0.6 m diameter)."""
-
-    inner_radius_range: tuple[float, float] = (0.05, 0.25)
-    """Tyre hole radius at difficulty 0 and 1; grows with the difficulty level."""
 
     easy_height_range: tuple[float, float] = (0.01, 0.03)
     """Per-tyre height range at difficulty 0."""
@@ -265,9 +266,6 @@ class WheelsTerrainCfg(SubTerrainCfg):
 
     clear_radius: float = 1.0
     """Radius of the tyre-free disc around the terrain center."""
-
-    ring_segments: int = 10
-    """Number of convex box wedges used to approximate one tyre ring."""
 
     def function(
         self, difficulty: float, spec: mujoco.MjSpec, rng: np.random.Generator
@@ -284,7 +282,6 @@ class WheelsTerrainCfg(SubTerrainCfg):
         )
         geometries = [TerrainGeometry(geom=ground)]
 
-        inner_radius = float(np.interp(level, (0.0, 1.0), self.inner_radius_range))
         height_range = (1.0 - level) * np.asarray(self.easy_height_range) + level * np.asarray(
             self.height_range
         )
@@ -292,10 +289,6 @@ class WheelsTerrainCfg(SubTerrainCfg):
         skip_radius = self.clear_radius + self.outer_radius
         origin_height = 0.0
         num_cells = int(np.ceil(max(size_x, size_y) / pitch)) + 1
-
-        ring_mid_radius = 0.5 * (inner_radius + self.outer_radius)
-        radial_half = 0.5 * (self.outer_radius - inner_radius)
-        tangential_half = self.outer_radius * np.sin(np.pi / self.ring_segments)
 
         for row in range(-num_cells, num_cells + 1):
             for col in range(-num_cells, num_cells + 1):
@@ -309,19 +302,12 @@ class WheelsTerrainCfg(SubTerrainCfg):
                 ):
                     continue
                 height = float(rng.uniform(*height_range))
-                for segment in range(self.ring_segments):
-                    angle = 2.0 * np.pi * (segment + 0.5) / self.ring_segments
-                    wedge = body.add_geom(
-                        type=mujoco.mjtGeom.mjGEOM_BOX,
-                        size=[tangential_half, radial_half, height / 2],
-                        pos=[
-                            position[0] + ring_mid_radius * np.cos(angle),
-                            position[1] + ring_mid_radius * np.sin(angle),
-                            height / 2,
-                        ],
-                        quat=[np.cos(angle / 2.0), 0.0, 0.0, np.sin(angle / 2.0)],
-                    )
-                    geometries.append(TerrainGeometry(geom=wedge))
+                tyre = body.add_geom(
+                    type=mujoco.mjtGeom.mjGEOM_CYLINDER,
+                    size=[self.outer_radius, height / 2, 0.0],
+                    pos=[position[0], position[1], height / 2],
+                )
+                geometries.append(TerrainGeometry(geom=tyre))
                 if (
                     abs(position[0] - center[0]) <= SPAWN_CENTER_HALF_EXTENT + self.outer_radius
                     and abs(position[1] - center[1]) <= SPAWN_CENTER_HALF_EXTENT + self.outer_radius

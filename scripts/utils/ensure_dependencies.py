@@ -5,10 +5,10 @@ Overview:
     missing or incompatible requirements with the current Python interpreter.
 
 Quick Start:
-    python scripts/utils/ensure_dependencies.py mujoco
+    python scripts/utils/ensure_dependencies.py deploy
 
 Notes:
-    Requires Python 3.12 or newer. The supported extras are mujoco and video.
+    Requires Python 3.12 or newer. The supported extras are deploy and video.
     The task and RSL-RL packages are not reinstalled.
 """
 
@@ -77,7 +77,7 @@ class OptionalDependencyInstaller:
 def main() -> None:
     """Ensure the requested optional dependency group is ready to use."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("extra", choices=("mujoco", "video"))
+    parser.add_argument("extra", choices=("deploy", "video"))
     args = parser.parse_args()
     try:
         OptionalDependencyInstaller(args.extra).ensure()

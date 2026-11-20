@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "go2_rl_lab"
-version = "0.1.7"
-description = "Go2 locomotion training environments for Isaac Lab."
+version = "0.2.0"
+description = "Go2 locomotion training environments implemented with mjlab (MuJoCo Warp)."
 requires-python = ">=3.12"
 license = { text = "MIT" }
 authors = [
@@ -15,8 +15,8 @@ maintainers = [
     { name = "Tianyang Wu" },
 ]
 dependencies = [
-    # Installed in editable mode from ../rsl_rl by go2_rl_lab.sh.
-    "rsl-rl-lib==3.3.0",
+    "mjlab==1.2.0",
+    "mujoco-warp==3.5.0",
 ]
 
 classifiers = [
@@ -26,12 +26,15 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 
+[project.entry-points."mjlab.tasks"]
+go2_rl_lab = "go2_rl_lab.tasks"
+
 [project.optional-dependencies]
 video = [
     "imageio-ffmpeg>=0.6.0",
 ]
-mujoco = [
-    "mujoco>=3.3.0",
+deploy = [
+    "mujoco>=3.5.0",
     "PyYAML>=6.0",
     "pygame>=2.6.0",
     "imageio>=2.37.0",
@@ -44,5 +47,6 @@ include = ["go2_rl_lab*"]
 
 [tool.setuptools.package-data]
 go2_rl_lab = [
-    "assets/usd/**/*.usd",
+    "assets/xmls/*.xml",
+    "assets/xmls/assets/*.obj",
 ]

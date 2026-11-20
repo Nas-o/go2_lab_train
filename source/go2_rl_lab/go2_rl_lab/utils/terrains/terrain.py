@@ -8,84 +8,11 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
-import isaaclab.sim as sim_utils
-from isaaclab.terrains import TerrainGeneratorCfg, TerrainImporter
+from mjlab.terrains import TerrainGeneratorCfg
 
 if TYPE_CHECKING:
-    from isaaclab.envs import ManagerBasedEnv
-
-
-class SolidColorTerrainImporter(TerrainImporter):
-    """Replace the ground's checker texture with the configured solid material."""
-
-    def import_ground_plane(self, name: str, size: tuple[float, float] | None = None) -> None:
-        """Bind a constant-color surface to the ground's visual mesh.
-
-        The standard importer retains the collision plane. Rebinding the visual
-        geometry removes EA's checker texture instead of only tinting it.
-        """
-        material_cfg = self.cfg.visual_material
-        if not isinstance(material_cfg, sim_utils.PreviewSurfaceCfg):
-            raise ValueError("Solid-color ground requires a PreviewSurfaceCfg visual material.")
-        super().import_ground_plane(name, size)
-        prim_path = f"{self.cfg.prim_path}/{name}"
-        material_path = f"{prim_path}/Looks/solid_color"
-        material_cfg.func(material_path, material_cfg)
-        sim_utils.bind_visual_material(f"{prim_path}/Environment/Geometry", material_path)
-
-
-class HighToLowTerrainImporter(TerrainImporter):
-    """Assign environments deterministically across terrains from hardest to easiest."""
-
-    envs_per_non_flat_terrain: int = 1
-
-    @staticmethod
-    def _column_is_flat(generator_cfg: TerrainGeneratorCfg) -> list[bool]:
-        """Return whether each generator column uses the flat sub-terrain."""
-        names = list(generator_cfg.sub_terrains.keys())
-        proportions = np.array(
-            [sub_cfg.proportion for sub_cfg in generator_cfg.sub_terrains.values()],
-            dtype=np.float64,
-        )
-        proportions /= proportions.sum()
-        cumulative = np.cumsum(proportions)
-        return [
-            names[int(np.argmax(col / generator_cfg.num_cols + 0.001 < cumulative))] == "flat"
-            for col in range(generator_cfg.num_cols)
-        ]
-
-    @classmethod
-    def column_replicas(cls, generator_cfg: TerrainGeneratorCfg) -> list[int]:
-        """Number of environments assigned to each generator column."""
-        return [
-            1 if flat else cls.envs_per_non_flat_terrain
-            for flat in cls._column_is_flat(generator_cfg)
-        ]
-
-
-    def _compute_env_origins_curriculum(self, num_envs: int, origins: torch.Tensor) -> torch.Tensor:
-        """Cycle through terrain cells in descending difficulty and ascending terrain type."""
-        num_rows = origins.shape[0]
-        if self.cfg.max_init_terrain_level is None:
-            max_init_level = num_rows - 1
-        else:
-            max_init_level = min(self.cfg.max_init_terrain_level, num_rows - 1)
-
-        self.max_terrain_level = num_rows
-        replicas = self.column_replicas(self.cfg.terrain_generator)
-        cells = torch.tensor(
-            [
-                (level, col)
-                for level in range(max_init_level, -1, -1)
-                for col, repeats in enumerate(replicas)
-                for _ in range(repeats)
-            ],
-            device=self.device,
-        )
-        env_cells = cells[torch.arange(num_envs, device=self.device) % cells.shape[0]]
-        self.terrain_levels = env_cells[:, 0]
-        self.terrain_types = env_cells[:, 1]
-        return origins[self.terrain_levels, self.terrain_types]
+    from mjlab.envs import ManagerBasedRlEnv
+    from mjlab.terrains import TerrainEntity
 
 
 class TerrainPositionLookup:
@@ -124,7 +51,7 @@ class TerrainPositionLookup:
         return torch.where(inside, self.column_types[columns], -1)
 
 
-def get_terrain_position_lookup(env: ManagerBasedEnv) -> TerrainPositionLookup | None:
+def get_terrain_position_lookup(env: ManagerBasedRlEnv) -> TerrainPositionLookup | None:
     """Cache geometric lookup metadata for generated terrain, leaving plane tasks unrestricted."""
     terrain = getattr(env.scene, "terrain", None)
     if terrain is None or terrain.cfg.terrain_type != "generator":
@@ -139,16 +66,16 @@ def get_terrain_position_lookup(env: ManagerBasedEnv) -> TerrainPositionLookup |
     return lookup
 
 
-def get_terrain_masks(env: ManagerBasedEnv) -> dict[str, torch.Tensor]:
+def get_terrain_masks(env: ManagerBasedRlEnv) -> dict[str, torch.Tensor]:
     """Return terrain masks from each robot's current base world position."""
     lookup = get_terrain_position_lookup(env)
     if lookup is None:
         return {}
-    terrain_ids = lookup.query(env.scene["robot"].data.root_pos_w.torch)
+    terrain_ids = lookup.query(env.scene["robot"].data.root_link_pos_w)
     return {name: terrain_ids == index for index, name in enumerate(lookup.names)}
 
 
-def get_assigned_terrain_masks(env: ManagerBasedEnv) -> dict[str, torch.Tensor]:
+def get_assigned_terrain_masks(env: ManagerBasedRlEnv) -> dict[str, torch.Tensor]:
     """Return cached terrain assignments for reset placement and curriculum statistics."""
     terrain = getattr(env.scene, "terrain", None)
     if terrain is None:
@@ -172,6 +99,53 @@ def get_assigned_terrain_masks(env: ManagerBasedEnv) -> dict[str, torch.Tensor]:
 
     terrain._assigned_terrain_masks = terrain_masks
     return terrain_masks
+
+
+def column_replicas(generator_cfg: TerrainGeneratorCfg) -> list[int]:
+    """Number of environments assigned to each generator column in playback.
+
+    The source importer assigns a single environment per non-flat terrain column
+    and a single environment per flat column, so every authored column appears
+    once before cells repeat.
+    """
+    return [1] * generator_cfg.num_cols
+
+
+def configure_high_to_low_play_origins(env: ManagerBasedRlEnv) -> None:
+    """Assign playback environments deterministically from hardest to easiest terrain.
+
+    Mirrors the source ``HighToLowTerrainImporter`` allocation on top of the
+    native mjlab terrain grid: rows descend by difficulty and columns ascend by
+    terrain type, repeating the first cell when there are more environments than
+    authored cells.
+    """
+    terrain: TerrainEntity = env.scene.terrain
+    generator_cfg = terrain.cfg.terrain_generator
+    if terrain.cfg.terrain_type != "generator" or generator_cfg is None:
+        return
+
+    num_rows = generator_cfg.num_rows
+    if terrain.cfg.max_init_terrain_level is None:
+        max_init_level = num_rows - 1
+    else:
+        max_init_level = min(terrain.cfg.max_init_terrain_level, num_rows - 1)
+
+    replicas = column_replicas(generator_cfg)
+    cells = torch.tensor(
+        [
+            (level, col)
+            for level in range(max_init_level, -1, -1)
+            for col, repeats in enumerate(replicas)
+            for _ in range(repeats)
+        ],
+        device=env.device,
+    )
+    env_cells = cells[torch.arange(env.num_envs, device=env.device) % cells.shape[0]]
+    terrain.terrain_levels = env_cells[:, 0]
+    terrain.terrain_types = env_cells[:, 1]
+    # ``Scene.env_origins`` forwards to the terrain entity, so assigning here is
+    # enough for reset events and the command term.
+    terrain.env_origins[:] = terrain.terrain_origins[terrain.terrain_levels, terrain.terrain_types]
 
 
 def configure_play_sub_terrains(
@@ -227,9 +201,9 @@ def configure_play_sub_terrains(
 
 
 __all__ = [
-    "HighToLowTerrainImporter",
-    "SolidColorTerrainImporter",
     "TerrainPositionLookup",
+    "column_replicas",
+    "configure_high_to_low_play_origins",
     "configure_play_sub_terrains",
     "get_assigned_terrain_masks",
     "get_terrain_masks",

@@ -6,21 +6,22 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from isaaclab.managers import SceneEntityCfg
+from mjlab.managers.scene_entity_config import SceneEntityCfg
 
 if TYPE_CHECKING:
-    from isaaclab.sensors import RayCaster
-    from isaaclab.envs import ManagerBasedRLEnv
+    from mjlab.envs import ManagerBasedRlEnv
+    from mjlab.sensor import RayCastSensor
 
 
 def _get_ray_hit_heights(
-    env: ManagerBasedRLEnv,
+    env: ManagerBasedRlEnv,
     sensor_cfg: SceneEntityCfg,
-) -> tuple[RayCaster, torch.Tensor]:
+) -> tuple[RayCastSensor, torch.Tensor]:
     """Return the scanner and finite world-frame ray-hit heights."""
-    sensor: RayCaster = env.scene.sensors[sensor_cfg.name]
-    ray_hit_heights = sensor.data.ray_hits_w.torch[..., 2]
-    finite_hits = torch.isfinite(ray_hit_heights)
+    sensor: RayCastSensor = env.scene.sensors[sensor_cfg.name]
+    hit_pos_w = sensor.data.hit_pos_w
+    ray_hit_heights = hit_pos_w[..., 2]
+    finite_hits = sensor.data.distances >= 0.0
     fallback_height = torch.where(
         finite_hits,
         ray_hit_heights,
@@ -29,14 +30,14 @@ def _get_ray_hit_heights(
     fallback_height = torch.where(
         torch.isfinite(fallback_height),
         fallback_height,
-        sensor.data.pos_w.torch[:, 2] - 1.0,
+        sensor.data.pos_w[:, 2] - 1.0,
     )
     ray_hit_heights = torch.where(finite_hits, ray_hit_heights, fallback_height.unsqueeze(1))
     return sensor, ray_hit_heights
 
 
 def _get_crop_mask(
-    sensor: RayCaster,
+    sensor: RayCastSensor,
     x_range: tuple[float, float],
     y_range: tuple[float, float],
 ) -> torch.Tensor:
@@ -49,8 +50,8 @@ def _get_crop_mask(
     if cache_key in crop_masks:
         return crop_masks[cache_key]
 
-    local_xy = sensor.ray_starts.torch[0, :, :2]
-    resolution = float(getattr(sensor.cfg.pattern_cfg, "resolution", 0.0))
+    local_xy = sensor.cfg.pattern.generate_rays(None, sensor.data.pos_w.device)[0][:, :2]
+    resolution = float(getattr(sensor.cfg.pattern, "resolution", 0.0))
     tolerance = max(1.0e-6, resolution * 1.0e-5)
     crop_mask = (
         (local_xy[:, 0] >= x_range[0] - tolerance)
@@ -69,7 +70,7 @@ def _get_crop_mask(
 
 
 def get_cropped_ray_hit_heights(
-    env: ManagerBasedRLEnv,
+    env: ManagerBasedRlEnv,
     sensor_cfg: SceneEntityCfg,
     x_range: tuple[float, float],
     y_range: tuple[float, float],
@@ -80,13 +81,13 @@ def get_cropped_ray_hit_heights(
 
 
 def ray_caster_height_scan(
-    env: ManagerBasedRLEnv,
+    env: ManagerBasedRlEnv,
     sensor_cfg: SceneEntityCfg,
     offset: float = 0.5,
 ) -> torch.Tensor:
     """Return finite sensor-relative height observations from the RayCaster."""
     sensor, ray_hit_heights = _get_ray_hit_heights(env, sensor_cfg)
-    return sensor.data.pos_w.torch[:, 2].unsqueeze(1) - ray_hit_heights - offset
+    return sensor.data.pos_w[:, 2].unsqueeze(1) - ray_hit_heights - offset
 
 
 __all__ = ["get_cropped_ray_hit_heights", "ray_caster_height_scan"]

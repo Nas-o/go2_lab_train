@@ -1,5 +1,5 @@
-"""Shared command-term implementations for Go2 tasks.
+"""Command utilities for the Go2 locomotion tasks."""
 
-Implementations are intentionally imported from their concrete submodules to
-avoid eager package-level imports and circular dependencies during task setup.
-"""
+from go2_rl_lab.cmd_utils.rl_gym_cmd import RLGymVelCommand, RLGymVelCommandCfg
+
+__all__ = ["RLGymVelCommand", "RLGymVelCommandCfg"]

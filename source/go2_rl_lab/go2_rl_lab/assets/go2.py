@@ -1,108 +1,115 @@
-"""Isaac Lab articulation configuration for the Unitree Go2."""
+"""mjlab entity configuration for the Unitree Go2."""
 
 from __future__ import annotations
 
-import os
-from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING
 
-import isaaclab.sim as sim_utils
-from isaaclab.assets.articulation import ArticulationCfg
-from isaaclab.utils.configclass import configclass
-from isaaclab_tasks.utils import preset
+import mujoco
+
+from mjlab.actuator import DelayedActuatorCfg
+from mjlab.entity import EntityArticulationInfoCfg, EntityCfg
+from mjlab.utils.os import update_assets
+from mjlab.utils.spec_config import CollisionCfg
 
 from go2_rl_lab.assets.go2_actuator import Go2ActuatorCfg
 
-if TYPE_CHECKING:
-    from pxr import Usd
+##
+# MJCF and assets.
+##
 
-_DEFAULT_GO2_USD_PATH = Path(__file__).resolve().parent / "usd" / "go2.usd"
-GO2_USD_PATH = Path(os.environ.get("GO2_USD_PATH", _DEFAULT_GO2_USD_PATH)).expanduser()
-"""Path to the Go2 USD asset. Override it with the ``GO2_USD_PATH`` environment variable."""
-
-
-def _deactivate_visual_branches(root_prim: Usd.Prim) -> int:
-    """Deactivate normalized Go2 ``visuals`` branches before environment replication.
-    We found that this can very effectively reduce cuda memory usage.
-    """
-    from pxr import Usd
-
-    stage = root_prim.GetStage()
-    visual_paths = [prim.GetPath() for prim in Usd.PrimRange(root_prim) if prim.GetName() == "visuals"]
-    for path in visual_paths:
-        stage.GetPrimAtPath(path).SetActive(False)
-    return len(visual_paths)
+GO2_XML_PATH: Path = Path(__file__).resolve().parent / "xmls" / "go2.xml"
+"""Path to the Go2 MJCF asset shipped with the task package."""
 
 
-def spawn_go2_from_usd(
-    prim_path: str,
-    cfg: Go2UsdFileCfg,
-    translation: tuple[float, float, float] | None = None,
-    orientation: tuple[float, float, float, float] | None = None,
-    **kwargs,
-):
-    """Spawn Go2 and optionally remove its visual-only branches before scene cloning."""
-    robot_prim = sim_utils.spawn_from_usd(
-        prim_path,
-        cfg,
-        translation=translation,
-        orientation=orientation,
-        **kwargs,
-    )
-    if not cfg.visuals_enabled:
-        _deactivate_visual_branches(robot_prim)
-    return robot_prim
+def get_assets(meshdir: str) -> dict[str, bytes]:
+    assets: dict[str, bytes] = {}
+    update_assets(assets, GO2_XML_PATH.parent / "assets", meshdir)
+    return assets
 
 
-@configclass
-class Go2UsdFileCfg(sim_utils.UsdFileCfg):
-    """USD spawn configuration used by the Go2 articulation."""
-
-    func: Callable | str = spawn_go2_from_usd
-    visuals_enabled: bool = True
-    """Whether visual-only branches remain active when the source robot is cloned."""
-
-    activate_contact_sensors: bool = True
-    rigid_props = sim_utils.RigidBodyPropertiesCfg(
-        disable_gravity=False,
-        retain_accelerations=False,
-        linear_damping=0.0,
-        angular_damping=0.0,
-        max_linear_velocity=1000.0,
-        max_angular_velocity=1000.0,
-        max_depenetration_velocity=1.0,
-    )
-    articulation_props = sim_utils.ArticulationRootPropertiesCfg(
-        enabled_self_collisions=True,
-        solver_position_iteration_count=8,
-        solver_velocity_iteration_count=4,
-    )
+def get_spec() -> mujoco.MjSpec:
+    spec = mujoco.MjSpec.from_file(str(GO2_XML_PATH))
+    spec.assets = get_assets(spec.meshdir)
+    return spec
 
 
-GO2_CFG = ArticulationCfg(
-    spawn=Go2UsdFileCfg(usd_path=str(GO2_USD_PATH)),
-    soft_joint_pos_limit_factor=0.9,
-    init_state=ArticulationCfg.InitialStateCfg(
-        pos=(0.0, 0.0, 0.4),
-        joint_pos={
-            ".*R_hip_joint": -0.1,
-            ".*L_hip_joint": 0.1,
-            "F[L,R]_thigh_joint": 0.8,
-            "R[L,R]_thigh_joint": 1.0,
-            ".*_calf_joint": -1.5,
-        },
-        joint_vel={".*": 0.0},
-    ),
-    actuators={
-        "Go2HV": Go2ActuatorCfg(
-            joint_names_expr=[".*"],
-            stiffness=25.0,
-            damping=0.5,
-            friction=0.01,
-            armature=preset(default=0.01, isaacsim_physx=0.0, newton_mjwarp=0.01),
-            min_delay=0,
-            max_delay=4,
-        ),
-    },
+##
+# Actuator config.
+##
+
+# Go2 motor curves, delays and friction require the Python actuator path instead
+# of a MuJoCo builtin position actuator.
+GO2_ACTUATOR_CFG = Go2ActuatorCfg(
+    target_names_expr=(".*",),
+    stiffness=25.0,
+    damping=0.5,
+    frictionloss=0.01,
+    armature=0.01,
+    X1=13.5,
+    X2=30.0,
+    Y1=20.2,
+    Y2=23.4,
+    Fs=0.0,
+    Fd=0.0,
+    Va=0.01,
 )
+
+GO2_DELAYED_ACTUATOR_CFG = DelayedActuatorCfg(
+    base_cfg=GO2_ACTUATOR_CFG,
+    delay_target="position",
+    delay_min_lag=0,
+    delay_max_lag=4,
+)
+
+##
+# Initial state.
+##
+
+INIT_STATE = EntityCfg.InitialStateCfg(
+    pos=(0.0, 0.0, 0.4),
+    joint_pos={
+        ".*R_hip_joint": -0.1,
+        ".*L_hip_joint": 0.1,
+        "F[L,R]_thigh_joint": 0.8,
+        "R[L,R]_thigh_joint": 1.0,
+        ".*_calf_joint": -1.5,
+    },
+    joint_vel={".*": 0.0},
+)
+
+##
+# Collision config.
+##
+
+# Keep articulation self-collisions enabled and collide every collision geom
+# with the terrain, matching the Isaac Lab articulation properties.
+FULL_COLLISION = CollisionCfg(
+    geom_names_expr=(".*_collision",),
+    contype=1,
+    conaffinity=1,
+    condim=3,
+    friction=(0.6,),
+    solimp=(0.9, 0.95, 0.023),
+)
+
+##
+# Final config.
+##
+
+GO2_ARTICULATION = EntityArticulationInfoCfg(
+    actuators=(GO2_DELAYED_ACTUATOR_CFG,),
+    soft_joint_pos_limit_factor=0.9,
+)
+
+
+def get_go2_robot_cfg() -> EntityCfg:
+    """Get a fresh Go2 robot configuration instance."""
+    return EntityCfg(
+        init_state=INIT_STATE,
+        collisions=(FULL_COLLISION,),
+        spec_fn=get_spec,
+        articulation=GO2_ARTICULATION,
+    )
+
+
+__all__ = ["GO2_XML_PATH", "get_assets", "get_go2_robot_cfg", "get_spec"]

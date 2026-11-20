@@ -1,6 +1,5 @@
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers.
 # All rights reserved.
-#
 # SPDX-License-Identifier: BSD-3-Clause
 #
 # Modified for the Go2-only Go2 RL Lab project.
@@ -8,255 +7,180 @@
 """Play and export a trained Go2 RSL-RL policy.
 
 Quick Start:
-    ./go2_rl_lab.sh --play --task go2-flat --checkpoint path/to/model.pt --viz newton_gl
+    ./go2_rl_lab.sh --play --task go2-flat --checkpoint path/to/model.pt
 
 Full Command:
-    ./go2_rl_lab.sh --play --task go2-flat --checkpoint path/to/model.pt \
-        --num_envs 4 --physics newton_mjwarp --video --video_length 200
-
-Notes:
-    Requires the configured Isaac Lab Python environment.
+    ./go2_rl_lab.sh --play --task go2-mixed --checkpoint path/to/model.pt \
+        --num_envs 4 --video --video_length 200
 """
 
+from __future__ import annotations
+
 import argparse
-
-from isaaclab.app import AppLauncher, launch_simulation
-
-# local imports
-import cli_args  # isort: skip
-import port_args  # isort: skip
-import runtime_args  # isort: skip
-
-# add argparse arguments
-parser = argparse.ArgumentParser(description="Play a trained Go2 RSL-RL policy.")
-parser.add_argument("--video", action="store_true", default=False, help="Record a playback video.")
-parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
-parser.add_argument(
-    "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
-)
-parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
-parser.add_argument("--task", type=str, required=True, help="Task ID to play.")
-parser.add_argument(
-    "--physics",
-    type=str,
-    choices=("isaacsim_physx", "newton_mjwarp"),
-    default=None,
-    help="Physics preset. Defaults to Newton MuJoCo-Warp.",
-)
-parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
-# append RSL-RL cli arguments
-cli_args.add_rsl_rl_args(parser)
-# append Rerun port arguments
-port_args.add_rerun_port_args(parser)
-# append AppLauncher cli args
-AppLauncher.add_app_launcher_args(parser)
-args_cli = parser.parse_args()
-port_args.validate_rerun_port_args(parser, args_cli)
-# Kit capture needs RTX cameras; automatic GL capture uses its own renderer.
-if args_cli.video and "kit" in (args_cli.visualizer or []):
-    args_cli.enable_cameras = True
-
-runtime_args.bootstrap_runtime(args_cli)
-
 import os
-import time
+import sys
+from dataclasses import asdict
+from pathlib import Path
+
 import torch
 
-import video_utils
+from mjlab.envs import ManagerBasedRlEnv
+from mjlab.rl import MjlabOnPolicyRunner, RslRlVecEnvWrapper
+from mjlab.tasks.registry import load_env_cfg, load_rl_cfg, load_runner_cls
+from mjlab.utils.os import get_checkpoint_path
+from mjlab.viewer import NativeMujocoViewer, ViserPlayViewer
 
-if args_cli.video:
-    video_utils.configure_video_writer()
-
-import go2_rl_lab.tasks  # ruff: ignore[unused-import]
-import gymnasium as gym
-from go2_rl_lab.utils.parser_cfg import parse_env_cfg
-from isaaclab.utils.assets import retrieve_file_path
-from isaaclab_tasks.utils import get_checkpoint_path
-from isaaclab_rl.entrypoints.common import apply_video_recording
-
-from rsl_rl.base.base_runner import BaseRunner
-from rsl_rl.base.base_runner_config import RslRlBaseRunnerCfg
-from rsl_rl.base.env import RslRlVecEnvWrapper
-from rsl_rl.utils import export_model_config, resolve_callable
+import export
+from go2_rl_lab.utils.terrains import configure_high_to_low_play_origins
 
 
-def _configure_play_visualizers(env_cfg) -> None:
-    """Disable playback charts and select the project's Rerun scene layout."""
-    from isaaclab.visualizers.visualizer_cfg import VisualizerCfg
+def parse_args(argv: list[str]) -> tuple[str, argparse.Namespace, list[str]]:
+    """Parse the project CLI flags, leaving tyro overrides for mjlab."""
+    parser = argparse.ArgumentParser(
+        description="Play and export a trained Go2 RSL-RL policy.",
+        add_help=False,
+    )
+    parser.add_argument("--task", type=str, required=True, help="Task ID to play.")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Checkpoint or exported policy path.")
+    parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
+    parser.add_argument("--video", action="store_true", default=False, help="Record a playback video.")
+    parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
+    parser.add_argument(
+        "--real-time",
+        action="store_true",
+        default=False,
+        help="Accepted for CLI compatibility; mjlab viewers already pace themselves in real time.",
+    )
+    parser.add_argument(
+        "--viewer",
+        type=str,
+        default="auto",
+        choices=("auto", "native", "viser"),
+        help="Playback viewer backend.",
+    )
+    parser.add_argument("--no-export", action="store_false", dest="export", help="Skip policy export.")
+    return parser.parse_known_args(argv)
 
-    if env_cfg.sim.default_visualizer_cfg is None:
-        env_cfg.sim.default_visualizer_cfg = VisualizerCfg(enable_live_plots=False)
+
+def resolve_checkpoint(task: str, checkpoint: str | None) -> Path:
+    """Return the checkpoint path, defaulting to the latest run of the task."""
+    if checkpoint:
+        path = Path(checkpoint).expanduser()
+        if not path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {path}")
+        return path
+    agent_cfg = load_rl_cfg(task)
+    log_root = Path("logs") / "rsl_rl" / agent_cfg.experiment_name
+    return get_checkpoint_path(log_root, agent_cfg.load_run, agent_cfg.load_checkpoint)
+
+
+def export_policy(
+    task: str,
+    runner: MjlabOnPolicyRunner,
+    env: RslRlVecEnvWrapper,
+    checkpoint_path: Path,
+) -> None:
+    """Export the TorchScript policy, ONNX model, and deployment metadata."""
+    current_obs = env.get_observations()
+    num_single_obs = int(current_obs["single_obs"].shape[-1])
+    num_actor_obs = int(current_obs["policy"].shape[-1])
+    num_actions = env.num_actions
+    export_dir = str(checkpoint_path.parent / "exported")
+
+    if hasattr(runner, "export_policy_as_jit"):
+        # MoE-CTS runners own a student-specific exporter.
+        runner.export_policy_as_jit(path=export_dir, filename="policy.pt")
     else:
-        env_cfg.sim.default_visualizer_cfg.enable_live_plots = False
-    cfgs = env_cfg.sim.visualizer_cfgs
-    cfgs = list(cfgs) if isinstance(cfgs, list) else ([] if cfgs is None else [cfgs])
-    for cfg in cfgs:
-        cfg.enable_live_plots = False
-    rerun_cfg = next((cfg for cfg in cfgs if cfg.visualizer_type == "rerun"), None)
-    if "rerun" in (args_cli.visualizer or []) or rerun_cfg is not None:
-        import rerun as rr
-        import rerun.blueprint as rrb
-        from isaaclab_visualizers.rerun import RerunVisualizer, RerunVisualizerCfg
+        export.export_policy_as_jit(
+            policy=runner.alg.get_policy(),
+            path=export_dir,
+            num_single_obs=num_single_obs,
+            num_actions=num_actions,
+            filename="policy.pt",
+        )
+    try:
+        runner.export_policy_to_onnx(path=export_dir, filename="policy.onnx")
+    except Exception as error:  # noqa: BLE001
+        print(f"[WARN] ONNX export failed: {error}")
 
-        class PlaybackRerunVisualizer(RerunVisualizer):
-            """Use the standard Rerun backend with the project's playback layout."""
-
-            def _apply_camera_pose(self, pose: tuple[tuple[float, float, float], tuple[float, float, float]]) -> None:
-                """Update the playback camera and display a single 3D scene view."""
-                super()._apply_camera_pose(pose)
-                if self._viewer is None or self._streaming_view_active:
-                    return
-                rr.send_blueprint(
-                    rrb.Blueprint(
-                        rrb.Spatial3DView(
-                            name="3D View",
-                            origin="/",
-                            line_grid=True,
-                            eye_controls=rrb.EyeControls3D(position=pose[0], look_target=pose[1]),
-                        ),
-                        rrb.TimePanel(state="hidden"),
-                        collapse_panels=True,
-                    )
-                )
-
-        if rerun_cfg is None:
-            rerun_cfg = RerunVisualizerCfg(class_type=PlaybackRerunVisualizer, enable_live_plots=False)
-            cfgs.append(rerun_cfg)
-        else:
-            rerun_cfg.class_type = PlaybackRerunVisualizer
-        rerun_cfg.keep_scalar_history = False
-    env_cfg.sim.visualizer_cfgs = cfgs
+    config_path = export.export_model_config(
+        path=export_dir,
+        checkpoint_path=str(checkpoint_path),
+        checkpoint_iteration=runner.current_learning_iteration,
+        task=task,
+        experiment_name=load_rl_cfg(task).experiment_name,
+        num_single_obs=num_single_obs,
+        num_actor_obs=num_actor_obs,
+        num_actions=num_actions,
+        control_dt=env.unwrapped.step_dt,
+    )
+    print(f"[INFO]: Exported policies to: {export_dir}")
+    print(f"[INFO]: Exported model configuration to: {config_path}")
 
 
 def main() -> None:
-    """Play with RSL-RL agent."""
-    # parse configuration
-    env_cfg = parse_env_cfg(
-        args_cli.task,
-        device=args_cli.device,
-        num_envs=args_cli.num_envs,
-        use_fabric=not args_cli.disable_fabric,
-        entry_point_key="play_env_cfg_entry_point",
-        physics=args_cli.physics,
-    )
-    env_cfg.scene.robot.spawn.visuals_enabled = True
-    port_args.apply_rerun_port_args(env_cfg, args_cli)
-    _configure_play_visualizers(env_cfg)
-    agent_cfg: RslRlBaseRunnerCfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
+    """Load, export, and play the policy."""
+    import mjlab.tasks  # noqa: F401  (populates the task registry)
 
-    # specify directory for logging experiments
-    log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
-    log_root_path = os.path.abspath(log_root_path)
-    print(f"[INFO] Loading experiment from directory: {log_root_path}")
-    if args_cli.checkpoint:
-        resume_path = retrieve_file_path(args_cli.checkpoint)
-    else:
-        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+    args, _remaining = parse_args(sys.argv[1:])
+    env_cfg = load_env_cfg(args.task, play=True)
+    agent_cfg = load_rl_cfg(args.task)
+    if args.num_envs is not None:
+        env_cfg.scene.num_envs = args.num_envs
 
-    log_dir = os.path.dirname(resume_path)
+    checkpoint_path = resolve_checkpoint(args.task, args.checkpoint)
+    print(f"[INFO]: Loading model checkpoint from: {checkpoint_path}")
+    device = "cuda:0"
 
-    args_cli.video_interval = 0
-    video_utils.configure_video_capture(env_cfg, args_cli)
-    apply_video_recording(env_cfg, log_dir, args_cli, subdir="play", checkpoint_path=resume_path)
-    launcher_args = vars(args_cli).copy()
-    launcher_args["physics"] = None
-    with launch_simulation(env_cfg, launcher_args):
-        agent_cfg.device = env_cfg.sim.device
-        play(env_cfg, agent_cfg, resume_path)
+    render_mode = "rgb_array" if args.video else None
+    env = ManagerBasedRlEnv(cfg=env_cfg, device=device, render_mode=render_mode)
+    configure_high_to_low_play_origins(env)
 
+    video_recorder = None
+    if args.video:
+        from mjlab.utils.wrappers import VideoRecorder
 
-def play(env_cfg, agent_cfg, resume_path: str) -> None:
-    """Load, export, and step the policy inside the selected simulation runtime."""
-    env = gym.make(args_cli.task, cfg=env_cfg)
-
-    try:
-        # wrap around environment for rsl-rl
-        env = RslRlVecEnvWrapper(
+        print("[INFO]: Recording playback video")
+        video_recorder = VideoRecorder(
             env,
-            clip_actions=agent_cfg.clip_actions,
-            clip_rewards=agent_cfg.clip_rewards,
+            video_folder=checkpoint_path.parent / "videos" / "play",
+            step_trigger=lambda step: step == 0,
+            video_length=args.video_length,
+            disable_logger=True,
         )
+        env = video_recorder
 
-        print(f"[INFO]: Loading model checkpoint from: {resume_path}")
-        # load previously trained model
-        runner_class = resolve_callable(agent_cfg.class_name)
-        runner: BaseRunner = runner_class(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-        runner.load(resume_path)
+    wrapped = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+    runner_cls = load_runner_cls(args.task) or MjlabOnPolicyRunner
+    runner = runner_cls(wrapped, asdict(agent_cfg), str(checkpoint_path.parent), device)
+    runner.load(str(checkpoint_path), load_cfg={"actor": True}, strict=True, map_location=device)
 
-        # obtain the trained policy for inference
-        policy = runner.get_inference_policy(device=env.unwrapped.device)
+    if args.export:
+        export_policy(args.task, runner, wrapped, checkpoint_path)
 
-        # extract the neural network module
-        policy_nn = runner.alg.policy
-
-        # extract the normalizer
-        if hasattr(policy_nn, "actor_obs_normalizer"):
-            normalizer = policy_nn.actor_obs_normalizer
-        else:
-            normalizer = None
-
-        # export policy to onnx/jit
-        export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
-        current_obs = env.get_observations()
-        dt = env.unwrapped.step_dt
-        runner.export_policy_as_jit(
-            path=export_model_dir,
-            normalizer=normalizer,
-            num_single_obs=int(current_obs["single_obs"].shape[-1]),
-            num_actions=env.num_actions,
-            filename="policy.pt",
-        )
-        runner.export_policy_as_onnx(
-            path=export_model_dir,
-            normalizer=normalizer,
-            filename="policy.onnx",
-        )
-
-        config_path = export_model_config(
-            path=export_model_dir,
-            checkpoint_path=resume_path,
-            checkpoint_iteration=runner.current_learning_iteration,
-            task=args_cli.task,
-            experiment_name=agent_cfg.experiment_name,
-            num_single_obs=int(current_obs["single_obs"].shape[-1]),
-            num_actor_obs=int(current_obs["policy"].shape[-1]),
-            num_actions=env.num_actions,
-            control_dt=dt,
-        )
-        print(f"[INFO]: Exported model configuration to: {config_path}")
-
-        # reset environment
-        obs = env.get_observations()
-        policy_nn.reset()
-        timestep = 0
-        # simulate environment
-        while env.unwrapped.sim.is_headless_or_exist_active_visualizer():
-            start_time = time.time()
-            # run everything in inference mode
+    if args.video:
+        policy = runner.get_inference_policy(device=device)
+        obs = wrapped.get_observations()
+        for _ in range(args.video_length):
             with torch.inference_mode():
-                # agent stepping
                 actions = policy(obs)
-                # env stepping
-                obs, _, dones, _ = env.step(actions)
-                policy_nn.reset(dones)
-            timestep += 1
-
-            if args_cli.video:
-                # Exit the play loop after recording one video
-                if timestep == args_cli.video_length:
-                    break
-
-            # time delay for real-time evaluation
-            sleep_time = dt - (time.time() - start_time)
-            if args_cli.real_time and sleep_time > 0:
-                time.sleep(sleep_time)
-
-    finally:
+                obs, _, _, _ = wrapped.step(actions)
         env.close()
+        return
+
+    if args.viewer == "auto":
+        has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+        viewer = "native" if has_display else "viser"
+    else:
+        viewer = args.viewer
+
+    policy = runner.get_inference_policy(device=device)
+    if viewer == "native":
+        NativeMujocoViewer(wrapped, policy).run()
+    else:
+        ViserPlayViewer(wrapped, policy).run()
+    env.close()
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    finally:
-        runtime_args.shutdown_runtime()
+    main()

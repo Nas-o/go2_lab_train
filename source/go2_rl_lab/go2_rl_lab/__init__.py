@@ -1,1 +1,1 @@
-"""Go2 terrain training environment for Isaac Lab."""
+"""Go2 RL Lab tasks implemented with mjlab."""

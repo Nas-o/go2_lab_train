@@ -1,14 +1,11 @@
 """Velocity-task MDP terms and configurations with explicit imports."""
 
-from isaaclab.envs.mdp import (
+from mjlab.envs.mdp import (
     JointPositionActionCfg,
-    UniformVelocityCommandCfg,
     bad_orientation,
     base_ang_vel,
     base_lin_vel,
     generated_commands,
-    illegal_contact,
-    joint_effort,
     joint_pos_limits,
     joint_pos_rel,
     joint_torques_l2,
@@ -16,11 +13,6 @@ from isaaclab.envs.mdp import (
     last_action,
     projected_gravity,
     push_by_setting_velocity,
-    randomize_actuator_gains,
-    randomize_rigid_body_com,
-    randomize_rigid_body_mass,
-    randomize_rigid_body_material,
-    reset_joints_by_scale,
     time_out,
 )
 
@@ -31,6 +23,17 @@ from go2_rl_lab.cmd_utils.rl_gym_cmd import (
 from go2_rl_lab.tasks.mixed.mdp.curriculums import (
     TerrainLevelsVelGym,
     gradual_reward_weight_modification,
+)
+
+from go2_rl_lab.tasks.mixed.mdp.events import (
+    randomize_action_joint_pos_offset,
+    reset_joints_by_scale,
+)
+
+from go2_rl_lab.tasks.mixed.mdp.observations import (
+    foot_contact_force_norm,
+    joint_acc,
+    joint_effort,
 )
 
 from go2_rl_lab.tasks.mixed.mdp.rewards import (
@@ -48,14 +51,8 @@ from go2_rl_lab.tasks.mixed.mdp.rewards import (
     undesired_contacts,
 )
 
-from go2_rl_lab.tasks.mixed.mdp.observations import (
-    foot_contact_force_norm,
-    joint_acc,
-)
-
-from go2_rl_lab.tasks.mixed.mdp.events import (
-    randomize_action_joint_pos_offset,
-    reset_root_state_uniform,
+from go2_rl_lab.tasks.mixed.mdp.terminations import (
+    illegal_contact,
 )
 
 from go2_rl_lab.utils.height_scan import (
@@ -66,7 +63,6 @@ __all__ = [
     "JointPositionActionCfg",
     "RLGymVelCommandCfg",
     "TerrainLevelsVelGym",
-    "UniformVelocityCommandCfg",
     "ang_vel_xy_l2",
     "bad_orientation",
     "base_ang_vel",
@@ -93,13 +89,8 @@ __all__ = [
     "projected_gravity",
     "push_by_setting_velocity",
     "randomize_action_joint_pos_offset",
-    "randomize_actuator_gains",
-    "randomize_rigid_body_com",
-    "randomize_rigid_body_mass",
-    "randomize_rigid_body_material",
     "ray_caster_height_scan",
     "reset_joints_by_scale",
-    "reset_root_state_uniform",
     "time_out",
     "track_ang_vel_z_exp",
     "track_lin_vel_xy_exp",

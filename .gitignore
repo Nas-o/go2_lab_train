@@ -11,12 +11,11 @@
 # Newton/ImGui viewer state
 /imgui.ini
 
-# USD files are ignored except for the bundled Go2 model
+# USD files are ignored; the task package ships the Go2 MJCF instead
 **/*.usd
 **/*.usda
 **/*.usdc
 **/*.usdz
-!source/go2_rl_lab/go2_rl_lab/assets/usd/**/*.usd
 
 # Python
 /.env/
@@ -67,6 +66,7 @@ datasets
 *.pt
 *.obj
 !deploy/deploy_mujoco/assets/go2/*.obj
+!source/go2_rl_lab/go2_rl_lab/assets/xmls/assets/*.obj
 deploy/deploy_mujoco/models/
 *.mtl
 *.STL

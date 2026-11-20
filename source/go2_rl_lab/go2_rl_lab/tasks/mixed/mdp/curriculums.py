@@ -7,12 +7,13 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from isaaclab.managers import CurriculumTermCfg, ManagerTermBase
+from mjlab.managers import ManagerTermBase
+from mjlab.managers.curriculum_manager import CurriculumTermCfg
 
 from go2_rl_lab.utils.terrains import get_assigned_terrain_masks
 
 if TYPE_CHECKING:
-    from isaaclab.envs import ManagerBasedRLEnv
+    from mjlab.envs import ManagerBasedRlEnv
 
     from go2_rl_lab.cmd_utils.rl_gym_cmd import RLGymVelCommand
 
@@ -20,8 +21,8 @@ if TYPE_CHECKING:
 class TerrainLevelsVelGym(ManagerTermBase):
     """Update terrain levels and report overall and per-terrain level statistics."""
 
-    def __init__(self, cfg: CurriculumTermCfg, env: ManagerBasedRLEnv) -> None:
-        super().__init__(cfg, env)
+    def __init__(self, cfg: CurriculumTermCfg, env: ManagerBasedRlEnv) -> None:
+        super().__init__(env)
         terrain_generator = env.scene.terrain.cfg.terrain_generator
         self._terrain_names = list(terrain_generator.sub_terrains) if terrain_generator is not None else []
         self._terrain_masks = get_assigned_terrain_masks(env)
@@ -38,7 +39,7 @@ class TerrainLevelsVelGym(ManagerTermBase):
 
     def __call__(
         self,
-        env: ManagerBasedRLEnv,
+        env: ManagerBasedRlEnv,
         env_ids: Sequence[int],
     ) -> dict[str, torch.Tensor]:
         """Promote or demote levels and return current and historical statistics."""
@@ -87,7 +88,7 @@ class TerrainLevelsVelGym(ManagerTermBase):
 
 
 def gradual_reward_weight_modification(
-    env: ManagerBasedRLEnv,
+    env: ManagerBasedRlEnv,
     env_ids: Sequence[int],
     term_name: str,
     initial_weight: float,
@@ -108,5 +109,7 @@ def gradual_reward_weight_modification(
 
     term_cfg = env.reward_manager.get_term_cfg(term_name)
     term_cfg.weight = weight
-    env.reward_manager.set_term_cfg(term_name, term_cfg)
     return weight
+
+
+__all__ = ["TerrainLevelsVelGym", "gradual_reward_weight_modification"]

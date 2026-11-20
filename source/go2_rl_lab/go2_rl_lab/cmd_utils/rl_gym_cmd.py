@@ -7,25 +7,22 @@ https://github.com/wty-yy/go2_rl_gym/blob/master/legged_gym/envs/base/legged_rob
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from itertools import product
 from typing import TYPE_CHECKING, Sequence
 
 import torch
 
-import isaaclab.utils.math as math_utils
-from isaaclab.managers import CommandTerm, CommandTermCfg
-from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
-from isaaclab.markers.config import (
-    BLUE_ARROW_X_MARKER_CFG,
-    GREEN_ARROW_X_MARKER_CFG,
-)
-from isaaclab.utils.configclass import configclass
+from mjlab.managers.command_manager import CommandTerm, CommandTermCfg
 
 from go2_rl_lab.utils.terrains import get_terrain_masks, get_terrain_position_lookup
 
 if TYPE_CHECKING:
-    from isaaclab.assets import Articulation
-    from isaaclab.envs import ManagerBasedRLEnv
+    import numpy as np
+
+    from mjlab.entity import Entity
+    from mjlab.envs import ManagerBasedRlEnv
+    from mjlab.viewer.debug_visualizer import DebugVisualizer
 
 
 _COMMAND_NAMES = ("lin_vel_x", "lin_vel_y", "ang_vel_yaw")
@@ -92,9 +89,8 @@ class RLGymVelCommand(CommandTerm):
     """Generate velocity commands using the Go2 RL Gym sampling scheme."""
 
     cfg: RLGymVelCommandCfg
-    _env: ManagerBasedRLEnv
 
-    def __init__(self, cfg: RLGymVelCommandCfg, env: ManagerBasedRLEnv):
+    def __init__(self, cfg: RLGymVelCommandCfg, env: ManagerBasedRlEnv):
         super().__init__(cfg, env)
         if cfg.visualizer_max_speed <= 0.0:
             raise ValueError("visualizer_max_speed must be positive.")
@@ -114,7 +110,7 @@ class RLGymVelCommand(CommandTerm):
             name: self._env_command_ranges[:, index] for index, name in enumerate(_COMMAND_NAMES)
         }
         self.max_lin_vel = self._get_max_lin_vel()
-        self.robot: Articulation = env.scene[cfg.asset_name]
+        self.robot: Entity = env.scene[cfg.entity_name]
         self._initialize_terrain_command_limits()
         self.zero_command_prob = 0.0
         self.max_command_x = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
@@ -411,7 +407,7 @@ class RLGymVelCommand(CommandTerm):
         if self._terrain_lookup is None:
             self._env_command_ranges.copy_(self._global_command_ranges)
             return
-        self.current_terrain_ids = self._terrain_lookup.query(self.robot.data.root_pos_w.torch)
+        self.current_terrain_ids = self._terrain_lookup.query(self.robot.data.root_link_pos_w)
         limits = self._terrain_max_ranges[self.current_terrain_ids + 1]
         # Saturate disjoint ranges too: a held request [3, 3] on a [-1, 1]
         # terrain becomes [1, 1], preserving ordered sampling bounds.
@@ -516,7 +512,7 @@ class RLGymVelCommand(CommandTerm):
         self._update_env_command_ranges()
         self._apply_terrain_command_limits()
         current_distance = torch.linalg.norm(
-            self.robot.data.root_pos_w.torch[:, :2] - self._env.scene.env_origins[:, :2],
+            self.robot.data.root_link_pos_w[:, :2] - self._env.scene.env_origins[:, :2],
             dim=1,
         )
         self.max_move_distance = torch.maximum(self.max_move_distance, current_distance)
@@ -524,206 +520,199 @@ class RLGymVelCommand(CommandTerm):
     def _resample_command(self, env_ids: Sequence[int]):
         pass
 
-    def _set_debug_vis_impl(self, debug_vis: bool):
-        if debug_vis:
-            if not hasattr(self, "goal_vel_visualizer"):
-                self.goal_vel_visualizer = VisualizationMarkers(self.cfg.goal_vel_visualizer_cfg)
-                self.current_vel_visualizer = VisualizationMarkers(self.cfg.current_vel_visualizer_cfg)
-            self.goal_vel_visualizer.set_visibility(True)
-            self.current_vel_visualizer.set_visibility(True)
-        elif hasattr(self, "goal_vel_visualizer"):
-            self.goal_vel_visualizer.set_visibility(False)
-            self.current_vel_visualizer.set_visibility(False)
-
-    def _debug_vis_callback(self, event):
-        if not self.robot.is_initialized:
+    def _debug_vis_impl(self, visualizer: "DebugVisualizer") -> None:
+        """Draw velocity command and actual velocity arrows."""
+        env_indices = visualizer.get_env_indices(self.num_envs)
+        if not env_indices:
             return
-        del event
-        env_ids = self._debug_vis_env_ids()
-        if env_ids.numel() == 0:
-            return
-        base_position_w = self.robot.data.root_pos_w.torch[env_ids].clone()
-        base_position_w[:, 2] += 0.5
-        desired_scale, desired_quaternion = self._resolve_xy_velocity_to_arrow(
-            self.velocity_command_b[env_ids, :2], env_ids
-        )
-        current_scale, current_quaternion = self._resolve_xy_velocity_to_arrow(
-            self.robot.data.root_lin_vel_b.torch[env_ids, :2], env_ids
-        )
-        self.goal_vel_visualizer.visualize(base_position_w, desired_quaternion, desired_scale)
-        self.current_vel_visualizer.visualize(base_position_w, current_quaternion, current_scale)
 
-    def _debug_vis_env_ids(self) -> torch.Tensor:
-        """Return the environments selected for command visualization."""
-        terrain_names = self.cfg.debug_vis_terrain_names
-        if terrain_names is None:
-            return torch.arange(self.num_envs, device=self.device)
-        terrain_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        for terrain_name in terrain_names:
-            terrain_mask |= self.terrain_masks.get(terrain_name, torch.zeros_like(terrain_mask))
-        return terrain_mask.nonzero(as_tuple=False).squeeze(-1)
+        base_position_w = self.robot.data.root_link_pos_w
+        base_heading_w = self.robot.data.heading_w
+        for batch in env_indices:
+            terrain_names = self.cfg.debug_vis_terrain_names
+            if terrain_names is not None:
+                masks = self.terrain_masks
+                if not any(
+                    bool(masks.get(name, torch.zeros(1, dtype=torch.bool, device=self.device))[batch])
+                    for name in terrain_names
+                ):
+                    continue
 
-    def _resolve_xy_velocity_to_arrow(
-        self,
-        xy_velocity: torch.Tensor,
-        env_ids: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        visualizer = getattr(self, "current_vel_visualizer", None)
-        if visualizer is None:
-            visualizer = self.goal_vel_visualizer
-        default_scale = visualizer.cfg.markers["arrow"].scale
-        arrow_scale = torch.tensor(default_scale, device=self.device).repeat(xy_velocity.shape[0], 1)
+            position = base_position_w[batch].clone()
+            position[2] += 0.5
+            heading = base_heading_w[batch]
+            goal_xy = self._capped_xy_velocity(self.velocity_command_b[batch, :2])
+            current_xy = self._capped_xy_velocity(self.robot.data.root_link_lin_vel_b[batch, :2])
+            visualizer.add_arrow(
+                position,
+                position + self._arrow_xy(goal_xy, heading),
+                color=(0.0, 1.0, 0.0, 0.6),
+                width=0.02,
+            )
+            visualizer.add_arrow(
+                position,
+                position + self._arrow_xy(current_xy, heading),
+                color=(0.0, 0.0, 1.0, 0.6),
+                width=0.02,
+            )
+
+    def _capped_xy_velocity(self, xy_velocity: torch.Tensor) -> torch.Tensor:
         safe_velocity = torch.nan_to_num(xy_velocity, nan=0.0, posinf=0.0, neginf=0.0)
-        safe_velocity = safe_velocity.clamp(
+        return safe_velocity.clamp(
             min=-self.cfg.visualizer_max_speed,
             max=self.cfg.visualizer_max_speed,
         )
-        speed = torch.linalg.norm(safe_velocity, dim=1)
-        speed = torch.nan_to_num(
-            speed,
-            nan=0.0,
-            posinf=self.cfg.visualizer_max_speed,
-            neginf=0.0,
-        ).clamp_max(self.cfg.visualizer_max_speed)
-        arrow_scale[:, 0] *= speed * 3.0
-        heading_angle = torch.atan2(safe_velocity[:, 1], safe_velocity[:, 0])
-        zeros = torch.zeros_like(heading_angle)
-        root_heading = self.robot.data.heading_w.torch
-        if env_ids is not None:
-            root_heading = root_heading[env_ids]
-        arrow_quaternion = math_utils.quat_from_euler_xyz(
-            zeros, zeros, root_heading + heading_angle
+
+    @staticmethod
+    def _arrow_xy(xy_velocity: torch.Tensor, heading: torch.Tensor) -> torch.Tensor:
+        """Rotate the body-frame xy velocity into a world-frame arrow displacement."""
+        cos_heading = torch.cos(heading)
+        sin_heading = torch.sin(heading)
+        return torch.stack(
+            [
+                cos_heading * xy_velocity[0] - sin_heading * xy_velocity[1],
+                sin_heading * xy_velocity[0] + cos_heading * xy_velocity[1],
+                torch.zeros_like(heading),
+            ]
         )
-        return arrow_scale, arrow_quaternion
 
 
-@configclass
+@dataclass(kw_only=True)
 class RLGymVelCommandCfg(CommandTermCfg):
     """Configuration for :class:`RLGymVelCommand`."""
 
-    class_type: type = RLGymVelCommand
     cmd_kind: str = "command/body/velocity"
-    element_names: list[str] = ["lin_vel_x", "lin_vel_y", "ang_vel_z"]
-    asset_name: str = "robot"
+    element_names: list[str] = field(default_factory=lambda: ["lin_vel_x", "lin_vel_y", "ang_vel_z"])
+    entity_name: str = "robot"
     dynamic_resample_commands: bool = True
     limit_vel_invert_when_continuous: bool = True
-    zero_command_curriculum: dict | None = {
-        "start_iter": 0,
-        "end_iter": 1500,
-        "start_value": 0.0,
-        "end_value": 0.1,
-    }
-    limit_vel_curriculum: list[dict] = [
-        {
-            "iter": 0,
-            "lin_vel_x": [-1, 1],
-            "lin_vel_y": [-1, 1],
-            "ang_vel_yaw": [-1, 0, 1],
-        },
-    ]
+    zero_command_curriculum: dict | None = field(
+        default_factory=lambda: {
+            "start_iter": 0,
+            "end_iter": 1500,
+            "start_value": 0.0,
+            "end_value": 0.1,
+        }
+    )
+    limit_vel_curriculum: list[dict] = field(
+        default_factory=lambda: [
+            {
+                "iter": 0,
+                "lin_vel_x": [-1, 1],
+                "lin_vel_y": [-1, 1],
+                "ang_vel_yaw": [-1, 0, 1],
+            },
+        ]
+    )
     """Iteration-indexed complete ``limit_vel`` configurations, one dict per stage."""
-    command_range_curriculum: list[dict] = [
-        {
-            "iter": 5000,
-            "lin_vel_x": [-1.0, 1.0],
-            "lin_vel_y": [-1.0, 1.0],
-            "ang_vel_yaw": [-2.0, 2.0],
-        },
-        {
-            "iter": 15000,
-            "lin_vel_x": [-2.0, 2.0],
-            "lin_vel_y": [-1.0, 1.0],
-            "ang_vel_yaw": [-3.0, 3.0],
-        },
-        {
-            "iter": 25000,
-            "lin_vel_x": [-3.0, 3.0],
-            "lin_vel_y": [-1.0, 1.0],
-            "ang_vel_yaw": [-3.0, 3.0],
-        },
-        {
-            "iter": 35000,
-            "lin_vel_x": [-4.0, 4.0],
-            "lin_vel_y": [-1.0, 1.0],
-            "ang_vel_yaw": [-3.0, 3.0],
-        },
-        {
-            "iter": 45000,
-            "lin_vel_x": [-4.5, 4.2],
-            "lin_vel_y": [-1.0, 1.0],
-            "ang_vel_yaw": [-3.0, 3.0],
-        },
-    ]
-    terrain_max_command_ranges: dict[str, dict[str, tuple[float, float]]] = {
-        "flat": {
-            "lin_vel_x": (-4.5, 4.2),
-            "lin_vel_y": (-1.0, 1.0),
-            "ang_vel_yaw": (-3.0, 3.0),
-        },
-        "wave": {
-            "lin_vel_x": (-1.5, 1.5),
-            "lin_vel_y": (-1.0, 1.0),
-            "ang_vel_yaw": (-1.5, 1.5),
-        },
-        "slope_up": {
-            "lin_vel_x": (-1.5, 1.5),
-            "lin_vel_y": (-1.0, 1.0),
-            "ang_vel_yaw": (-1.5, 1.5),
-        },
-        "slope_down": {
-            "lin_vel_x": (-1.5, 1.5),
-            "lin_vel_y": (-1.0, 1.0),
-            "ang_vel_yaw": (-1.5, 1.5),
-        },
-        "rough_slope": {
-            "lin_vel_x": (-1.5, 1.5),
-            "lin_vel_y": (-1.0, 1.0),
-            "ang_vel_yaw": (-1.5, 1.5),
-        },
-        "stairs_up": {
-            "lin_vel_x": (-1.0, 1.0),
-            "lin_vel_y": (-1.0, 1.0),
-            "ang_vel_yaw": (-1.5, 1.5),
-        },
-        "stairs_down": {
-            "lin_vel_x": (-1.0, 1.0),
-            "lin_vel_y": (-1.0, 1.0),
-            "ang_vel_yaw": (-1.5, 1.5),
-        },
-        "obstacles": {
-            "lin_vel_x": (-1.0, 1.0),
-            "lin_vel_y": (-1.0, 1.0),
-            "ang_vel_yaw": (-1.5, 1.5),
-        },
-        "wheels": {
-            "lin_vel_x": (-2.0, 1.5),
-            "lin_vel_y": (-1.0, 1.0),
-            "ang_vel_yaw": (-1.5, 1.5),
-        },
-        "small_squares": {
-            "lin_vel_x": (-1.0, 1.0),
-            "lin_vel_y": (-1.0, 1.0),
-            "ang_vel_yaw": (-1.5, 1.5),
-        },
-    }
-    command_clip_rules: list[dict] = [  # checking is performed according to the order of the list
-        {
-            "command": "lin_vel_x",
-            "limit": 2.0,  # if |lin_vel_x| > 2.0, clip lin_vel_y and ang_vel_yaw
-            "clip": {
-                "lin_vel_y": (-0.5, 0.5),
-                "ang_vel_yaw": (-1.0, 1.0),
+    command_range_curriculum: list[dict] = field(
+        default_factory=lambda: [
+            {
+                "iter": 5000,
+                "lin_vel_x": [-1.0, 1.0],
+                "lin_vel_y": [-1.0, 1.0],
+                "ang_vel_yaw": [-2.0, 2.0],
             },
-        },
-        {
-            "command": "ang_vel_yaw",
-            "limit": 2.0,  # if |ang_vel_yaw| > 2.0, clip lin_vel_x and lin_vel_y
-            "clip": {
-                "lin_vel_x": (-2.0, 2.0),
+            {
+                "iter": 15000,
+                "lin_vel_x": [-2.0, 2.0],
+                "lin_vel_y": [-1.0, 1.0],
+                "ang_vel_yaw": [-3.0, 3.0],
+            },
+            {
+                "iter": 25000,
+                "lin_vel_x": [-3.0, 3.0],
+                "lin_vel_y": [-1.0, 1.0],
+                "ang_vel_yaw": [-3.0, 3.0],
+            },
+            {
+                "iter": 35000,
+                "lin_vel_x": [-4.0, 4.0],
+                "lin_vel_y": [-1.0, 1.0],
+                "ang_vel_yaw": [-3.0, 3.0],
+            },
+            {
+                "iter": 45000,
+                "lin_vel_x": [-4.5, 4.2],
+                "lin_vel_y": [-1.0, 1.0],
+                "ang_vel_yaw": [-3.0, 3.0],
+            },
+        ]
+    )
+    terrain_max_command_ranges: dict[str, dict[str, tuple[float, float]]] = field(
+        default_factory=lambda: {
+            "flat": {
+                "lin_vel_x": (-4.5, 4.2),
                 "lin_vel_y": (-1.0, 1.0),
+                "ang_vel_yaw": (-3.0, 3.0),
             },
-        },
-    ]
+            "wave": {
+                "lin_vel_x": (-1.5, 1.5),
+                "lin_vel_y": (-1.0, 1.0),
+                "ang_vel_yaw": (-1.5, 1.5),
+            },
+            "slope_up": {
+                "lin_vel_x": (-1.5, 1.5),
+                "lin_vel_y": (-1.0, 1.0),
+                "ang_vel_yaw": (-1.5, 1.5),
+            },
+            "slope_down": {
+                "lin_vel_x": (-1.5, 1.5),
+                "lin_vel_y": (-1.0, 1.0),
+                "ang_vel_yaw": (-1.5, 1.5),
+            },
+            "rough_slope": {
+                "lin_vel_x": (-1.5, 1.5),
+                "lin_vel_y": (-1.0, 1.0),
+                "ang_vel_yaw": (-1.5, 1.5),
+            },
+            "stairs_up": {
+                "lin_vel_x": (-1.0, 1.0),
+                "lin_vel_y": (-1.0, 1.0),
+                "ang_vel_yaw": (-1.5, 1.5),
+            },
+            "stairs_down": {
+                "lin_vel_x": (-1.0, 1.0),
+                "lin_vel_y": (-1.0, 1.0),
+                "ang_vel_yaw": (-1.5, 1.5),
+            },
+            "obstacles": {
+                "lin_vel_x": (-1.0, 1.0),
+                "lin_vel_y": (-1.0, 1.0),
+                "ang_vel_yaw": (-1.5, 1.5),
+            },
+            "wheels": {
+                "lin_vel_x": (-2.0, 1.5),
+                "lin_vel_y": (-1.0, 1.0),
+                "ang_vel_yaw": (-1.5, 1.5),
+            },
+            "small_squares": {
+                "lin_vel_x": (-1.0, 1.0),
+                "lin_vel_y": (-1.0, 1.0),
+                "ang_vel_yaw": (-1.5, 1.5),
+            },
+        }
+    )
+    command_clip_rules: list[dict] = field(
+        default_factory=lambda: [  # checking is performed according to the order of the list
+            {
+                "command": "lin_vel_x",
+                "limit": 2.0,  # if |lin_vel_x| > 2.0, clip lin_vel_y and ang_vel_yaw
+                "clip": {
+                    "lin_vel_y": (-0.5, 0.5),
+                    "ang_vel_yaw": (-1.0, 1.0),
+                },
+            },
+            {
+                "command": "ang_vel_yaw",
+                "limit": 2.0,  # if |ang_vel_yaw| > 2.0, clip lin_vel_x and lin_vel_y
+                "clip": {
+                    "lin_vel_x": (-2.0, 2.0),
+                    "lin_vel_y": (-1.0, 1.0),
+                },
+            },
+        ]
+    )
     """Priority-ordered coupling rules applied after sampling and current-terrain clipping.
 
     Each rule triggers when the magnitude of its ``command`` exceeds ``limit``,
@@ -732,7 +721,6 @@ class RLGymVelCommandCfg(CommandTermCfg):
     an earlier rule and an earlier rule wins on the dimensions it clips.
     """
     resampling_time: float = 5.0
-    resampling_time_range: tuple[float, float] = (5.0, 5.0)
     limit_ang_vel_at_zero_command_prob: float = 0.2
     limit_vel_prob: float = 0.2
     limit_vel_hold_prob: float = 0.0
@@ -746,22 +734,24 @@ class RLGymVelCommandCfg(CommandTermCfg):
     debug_vis_terrain_names: tuple[str, ...] | None = None
     """Terrain names to include in debug visualization, or all when unset."""
 
-    @configclass
+    @dataclass
     class Ranges:
         lin_vel_x: tuple[float, float] = (-0.5, 0.5)
         lin_vel_y: tuple[float, float] = (-0.5, 0.5)
         ang_vel_yaw: tuple[float, float] = (-1.0, 1.0)
 
-    ranges: Ranges = Ranges()
-    goal_vel_visualizer_cfg: VisualizationMarkersCfg = GREEN_ARROW_X_MARKER_CFG.replace(
-        prim_path="/Visuals/Command/velocity_goal"
-    )
-    current_vel_visualizer_cfg: VisualizationMarkersCfg = BLUE_ARROW_X_MARKER_CFG.replace(
-        prim_path="/Visuals/Command/velocity_current"
-    )
-    goal_vel_visualizer_cfg.markers["arrow"].scale = (0.5, 0.5, 0.5)
-    current_vel_visualizer_cfg.markers["arrow"].scale = (0.5, 0.5, 0.5)
+        def to_dict(self) -> dict[str, tuple[float, float]]:
+            return {
+                "lin_vel_x": tuple(self.lin_vel_x),
+                "lin_vel_y": tuple(self.lin_vel_y),
+                "ang_vel_yaw": tuple(self.ang_vel_yaw),
+            }
 
+    ranges: Ranges = field(default_factory=Ranges)
+    resampling_time_range: tuple[float, float] = (5.0, 5.0)
+
+    def build(self, env: ManagerBasedRlEnv) -> RLGymVelCommand:
+        return RLGymVelCommand(self, env)
 
 
 __all__ = ["RLGymVelCommand", "RLGymVelCommandCfg"]

@@ -1,5 +1,5 @@
-"""Discover and register the Go2 velocity locomotion tasks."""
+"""Go2 locomotion task registrations."""
 
-from isaaclab_tasks.utils import import_packages
+from go2_rl_lab.tasks import flat, mixed
 
-import_packages(__name__, blacklist_pkgs=[".mdp"])
+__all__ = ["flat", "mixed"]
